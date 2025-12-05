@@ -1,256 +1,187 @@
-# -*- coding: utf-8 -*-
-from __future__ import division
-import time
-import random
 from Pyro4 import expose
+from collections import deque
+import random
 
-try:
-    xrange
-except NameError:
-    xrange = range
-
-@expose
 class Solver:
-    """
-    Паралельний пошук всіх шляхів між двома вершинами у графі.
-    Використовує ІТЕРАТИВНИЙ DFS для уникнення переповнення стеку.
-    """
     def __init__(self, workers=None, input_file_name=None, output_file_name=None):
-        self.workers = workers
         self.input_file_name = input_file_name
         self.output_file_name = output_file_name
-        print "GraphPathFinder initialized"
+        self.workers = workers
 
     def solve(self):
-        print "=== Parallel Path Finding Started ==="
-        start_time = time.time()
         
-        n = self.read_input_size()
-        graph = self.generate_random_graph(n)
-        
-        workers_to_use = self.workers if self.workers is not None else []
-        num_workers = len(workers_to_use)
-        
-        print "Graph size: %d vertices" % n
-        print "Workers: %d" % num_workers
-        
-        edge_count = sum(len(neighbors) for neighbors in graph.values())
-        print "Edges: %d" % edge_count
+        graph_size = self.read_input()
+        graph = self.generate_graph(graph_size)
         
         start_vertex = 0
-        target_vertex = n - 1
+        end_vertex = graph_size - 1
         
-        print "Finding paths: %d -> %d" % (start_vertex, target_vertex)
+        neighbors = graph.get(start_vertex, [])
         
-        all_paths = []
+        if not neighbors:
+            self.write_output(None, graph_size)
+            return
         
-        # Паралельний пошук
-        if num_workers > 0 and start_vertex in graph and len(graph[start_vertex]) > 0:
-            start_neighbors = graph[start_vertex]
-            print "Start neighbors: %d neighbors" % len(start_neighbors)
-            
-            chunk_size = max(1, len(start_neighbors) // num_workers)
-            tasks = []
-            
-            for w_idx in xrange(num_workers):
-                if w_idx >= len(workers_to_use):
-                    break
-                    
-                start_idx = w_idx * chunk_size
-                if w_idx == num_workers - 1:
-                    end_idx = len(start_neighbors)
-                else:
-                    end_idx = start_idx + chunk_size
+        n_workers = len(self.workers)
+        
+        base_size = len(neighbors) // n_workers
+        remainder = len(neighbors) % n_workers
+        
+        mapped = []
+        start_idx = 0
+        
+        for i in range(n_workers):
+            chunk_size = base_size + (1 if i < remainder else 0)
+            if chunk_size == 0:
+                break
                 
-                if start_idx < len(start_neighbors):
-                    neighbor_chunk = start_neighbors[start_idx:end_idx]
-                    worker = workers_to_use[w_idx]
-                    
-                    print "Worker %d: %d neighbors" % (w_idx + 1, len(neighbor_chunk))
-                    
-                    task = worker.find_paths_worker_iterative(
-                        graph,
-                        start_vertex,
-                        target_vertex,
-                        neighbor_chunk,
-                        min(n * 2, 750)  # Обмеження довжини шляху
-                    )
-                    tasks.append(task)
+            end_idx = start_idx + chunk_size
+            worker_neighbors = neighbors[start_idx:end_idx]
+            start_idx = end_idx
             
-            for task_idx, task in enumerate(tasks):
-                worker_paths = task.value
-                if worker_paths:
-                    print "Worker %d: %d paths" % (task_idx + 1, len(worker_paths))
-                    all_paths.extend(worker_paths)
-        else:
-            print "Sequential mode"
-            all_paths = self.find_all_paths_iterative(graph, start_vertex, target_vertex, min(n * 2, 750))
-        
-        elapsed = time.time() - start_time
-        
-        # Видалення дублікатів
-        unique_paths = []
-        seen = set()
-        for path in all_paths:
-            path_tuple = tuple(path)
-            if path_tuple not in seen:
-                seen.add(path_tuple)
-                unique_paths.append(path)
-        
-        all_paths = unique_paths
-        
-        self.write_output(all_paths, elapsed, n, start_vertex, target_vertex, num_workers)
-        
-        print "=== Completed in %.4f sec ===" % elapsed
-        print "Total paths: %d" % len(all_paths)
-        
-        return all_paths
-
-    def read_input_size(self):
-        """Читає розмір графа з файлу"""
-        try:
-            with open(self.input_file_name, 'r') as f:
-                lines = [line.strip() for line in f if line.strip()]
-            n = int(lines[0])
-            if n < 2:
-                raise ValueError("N must be >= 2")
-            return n
-        except Exception as e:
-            print "Error reading input: %s" % str(e)
-            return 15
-
-    @staticmethod
-    def generate_random_graph(n, density=0.02):
-        """
-        Генерує випадковий граф з МЕНШОЮ щільністю для великих N.
-        Для N=1000 використовуємо density=0.15 замість 0.3
-        """
-        graph = {i: [] for i in xrange(n)}
-        random.seed(42)
-        
-        # Базове дерево для зв'язності
-        for i in xrange(1, n):
-            parent = random.randint(0, i - 1)
-            graph[parent].append(i)
-        
-        # Додаткові ребра (менше для великих графів)
-        max_edges = n * (n - 1) // 2
-        current_edges = n - 1
-        target_edges = int(max_edges * density)
-        
-        attempts = 0
-        max_attempts = min(target_edges * 10, n * 100)
-        
-        while current_edges < target_edges and attempts < max_attempts:
-            i = random.randint(0, n - 1)
-            j = random.randint(0, n - 1)
+            graph_str = self.serialize_graph(graph)
             
-            if i != j and j not in graph[i]:
-                graph[i].append(j)
-                current_edges += 1
-            attempts += 1
+            mapped.append(
+                self.workers[i].mymap(
+                    graph_str,
+                    str(start_vertex),
+                    str(end_vertex),
+                    ','.join(str(v) for v in worker_neighbors)
+                )
+            )
         
-        for vertex in graph:
-            graph[vertex].sort()
+        shortest_path = self.myreduce(mapped)
         
-        return graph
-
+        self.write_output(shortest_path, graph_size)
+    
     @staticmethod
     @expose
-    def find_paths_worker_iterative(graph, start_vertex, target_vertex, start_neighbors, max_length):
-        """
-        ІТЕРАТИВНИЙ DFS для уникнення переповнення стеку рекурсії.
-        Використовує явний стек замість рекурсії.
-        """
-        all_paths = []
-        max_paths = 10000  # Обмеження на кількість шляхів від одного воркера
+    def mymap(graph_str, start_str, end_str, initial_neighbors_str):
+        graph = Solver.deserialize_graph(graph_str)
+        start = int(start_str)
+        end = int(end_str)
+        initial_neighbors = [int(v) for v in initial_neighbors_str.split(',') if v]
         
-        for first_neighbor in start_neighbors:
-            if len(all_paths) >= max_paths:
-                break
+        shortest_path = None
+        shortest_length = float('inf')
+        
+        for initial_vertex in initial_neighbors:
+            path = Solver.bfs(graph, start, end, initial_vertex)
             
-            # Стек зберігає: (поточна_вершина, шлях, множина_відвіданих)
-            stack = [(first_neighbor, [start_vertex, first_neighbor], {start_vertex, first_neighbor})]
-            
-            while stack and len(all_paths) < max_paths:
-                current, path, visited = stack.pop()
-                
-                # Перевірка довжини шляху
-                if len(path) > max_length:
-                    continue
-                
-                # Знайшли ціль
-                if current == target_vertex:
-                    all_paths.append(list(path))
-                    continue
-                
-                # Додаємо сусідів до стеку
-                if current in graph:
-                    # Обробляємо сусідів у зворотному порядку для правильного порядку обходу
-                    for neighbor in reversed(graph[current]):
-                        if neighbor not in visited:
-                            new_visited = visited | {neighbor}
-                            new_path = path + [neighbor]
-                            stack.append((neighbor, new_path, new_visited))
+            if path and len(path) < shortest_length:
+                shortest_path = path
+                shortest_length = len(path)
         
-        return all_paths
-
-    def find_all_paths_iterative(self, graph, start, target, max_length):
-        """
-        Послідовний ІТЕРАТИВНИЙ пошук всіх шляхів.
-        """
-        all_paths = []
-        max_paths = 5000
+        return shortest_path
+    
+    @staticmethod
+    def bfs(graph, start, target, first_step):
+        queue = deque([(first_step, [start, first_step])])
+        visited = {start, first_step}
         
-        stack = [(start, [start], {start})]
-        
-        while stack and len(all_paths) < max_paths:
-            current, path, visited = stack.pop()
-            
-            if len(path) > max_length:
-                continue
+        while queue:
+            current, path = queue.popleft()
             
             if current == target:
-                all_paths.append(list(path))
-                continue
+                return path
             
-            if current in graph:
-                for neighbor in reversed(graph[current]):
-                    if neighbor not in visited:
-                        new_visited = visited | {neighbor}
-                        new_path = path + [neighbor]
-                        stack.append((neighbor, new_path, new_visited))
+            for neighbor in graph.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    new_path = path + [neighbor]
+                    queue.append((neighbor, new_path))
         
-        return all_paths
-
-    def write_output(self, paths, execution_time, n, start, target, num_workers):
-        """Запис результатів"""
-        with open(self.output_file_name, 'w') as f:
-            f.write("=== Path Finding Results ===\n")
-            f.write("Graph size: %d vertices\n" % n)
-            f.write("Search: %d -> %d\n" % (start, target))
-            f.write("Workers: %d\n" % num_workers)
-            f.write("Total paths: %d\n" % len(paths))
-            f.write("Time: %.4f sec\n" % execution_time)
-            f.write("\n")
+        return None
+    
+    @staticmethod
+    @expose
+    def myreduce(mapped):
+        
+        shortest_path = None
+        shortest_length = float('inf')
+        
+        for worker_id, worker_result in enumerate(mapped):
+            path = worker_result.value
             
-            if len(paths) > 0:
-                lengths = [len(p) - 1 for p in paths]
-                f.write("=== Statistics ===\n")
-                f.write("Shortest: %d edges\n" % min(lengths))
-                f.write("Longest: %d edges\n" % max(lengths))
-                f.write("Average: %.2f edges\n" % (sum(lengths) / len(lengths)))
-                f.write("\n")
+            if path and len(path) < shortest_length:
+                shortest_path = path
+                shortest_length = len(path)
+        
+        return shortest_path
+    
+    def read_input(self):
+        f = open(self.input_file_name, 'r')
+        graph_size = int(f.readline().strip())
+        f.close()
+        
+        return graph_size
+    
+    def generate_graph(self, size):
+        graph = {i: [] for i in range(size)}
+        
+        for i in range(size - 1):
+            graph[i].append(i + 1)
+            if i > 0:
+                graph[i].append(i - 1)
+        
+        if size > 1:
+            graph[size - 1].append(size - 2)
+        
+        for vertex in range(size):
+            current_neighbors = len(graph[vertex])
+            target_neighbors = random.randint(50, min(100, size - 1))
+            
+            attempts = 0
+            while current_neighbors < target_neighbors and attempts < 100:
+                neighbor = random.randint(0, size - 1)
                 
-                f.write("=== First 10 Paths ===\n")
-                for i, path in enumerate(paths[:10]):
-                    if len(path) <= 20:
-                        path_str = " -> ".join(str(v) for v in path)
-                    else:
-                        path_str = " -> ".join(str(v) for v in path[:10]) + " ... " + str(path[-1])
-                    f.write("%d. %s (len: %d)\n" % (i + 1, path_str, len(path) - 1))
+                if neighbor != vertex and neighbor not in graph[vertex]:
+                    graph[vertex].append(neighbor)
+                    if vertex not in graph[neighbor]:
+                        graph[neighbor].append(vertex)
+                    current_neighbors += 1
                 
-                if len(paths) > 10:
-                    f.write("\n... and %d more\n" % (len(paths) - 10))
-            else:
-                f.write("No paths found\n")
+                attempts += 1
+        
+        return graph
+    
+    def write_output(self, path, graph_size):
+        f = open(self.output_file_name, 'w')
+        
+        f.write("Graph size: %d vertices\n" % graph_size)
+        f.write("Search: vertex 0 -> vertex %d\n\n" % (graph_size - 1))
+        
+        if path:
+            f.write("Shortest path found:\n")
+            f.write(" -> ".join(str(v) for v in path) + "\n\n")
+            f.write("Path length: %d vertices\n" % len(path))
+            f.write("Number of edges: %d\n" % (len(path) - 1))
+        else:
+            f.write("No path exists between vertices\n")
+        
+        f.close()
+        print("Output written")
+    
+    @staticmethod
+    def serialize_graph(graph):
+        parts = []
+        for vertex in sorted(graph.keys()):
+            neighbors = graph[vertex]
+            neighbor_str = ",".join(str(n) for n in neighbors)
+            parts.append("%d:%s" % (vertex, neighbor_str))
+        return ";".join(parts)
+    
+    @staticmethod
+    def deserialize_graph(graph_str):
+        graph = {}
+        if not graph_str:
+            return graph
+        
+        for part in graph_str.split(";"):
+            if ":" in part:
+                vertex_str, neighbors_str = part.split(":", 1)
+                vertex = int(vertex_str)
+                neighbors = [int(n) for n in neighbors_str.split(",") if n]
+                graph[vertex] = neighbors
+        
+        return graph
